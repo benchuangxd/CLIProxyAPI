@@ -17,16 +17,12 @@ func TestResetFirstSelectorPick_PrefersEarliestReset(t *testing.T) {
 	unix := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
 
 	auths := []*Auth{
-		{ID: "a-unknown", Provider: "claude"},
-		{ID: "b-late", Provider: "claude", Quota: QuotaState{Signals: map[string]string{
+		{ID: "a-late", Provider: "claude", Quota: QuotaState{Signals: map[string]string{
 			"Anthropic-Ratelimit-Unified-7d-Reset": unix(96 * time.Hour),
 			"Anthropic-Ratelimit-Unified-5h-Reset": unix(time.Hour),
 		}}},
-		{ID: "c-soon", Provider: "claude", Quota: QuotaState{Signals: map[string]string{
+		{ID: "b-soon", Provider: "claude", Quota: QuotaState{Signals: map[string]string{
 			"Anthropic-Ratelimit-Unified-7d-Reset": unix(24 * time.Hour),
-		}}},
-		{ID: "d-expired", Provider: "claude", Quota: QuotaState{Signals: map[string]string{
-			"Anthropic-Ratelimit-Unified-7d-Reset": unix(-time.Hour),
 		}}},
 	}
 
@@ -34,8 +30,38 @@ func TestResetFirstSelectorPick_PrefersEarliestReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pick() error = %v", err)
 	}
-	if got == nil || got.ID != "c-soon" {
-		t.Fatalf("Pick() auth = %v, want c-soon", got)
+	if got == nil || got.ID != "b-soon" {
+		t.Fatalf("Pick() auth = %v, want b-soon", got)
+	}
+}
+
+func TestResetFirstSelectorPick_MeasuresUnknownResetsFirst(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_000_000, 0)
+	selector := &ResetFirstSelector{nowFunc: func() time.Time { return now }}
+	unix := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	soon := &Auth{ID: "a-soon", Provider: "codex", Quota: QuotaState{Signals: map[string]string{
+		"X-Codex-Secondary-Reset-At": unix(time.Hour),
+	}}}
+
+	cases := []struct {
+		name string
+		auth *Auth
+	}{
+		{"never observed", &Auth{ID: "b-unknown", Provider: "codex"}},
+		{"window rolled over", &Auth{ID: "b-expired", Provider: "codex", Quota: QuotaState{Signals: map[string]string{
+			"X-Codex-Secondary-Reset-At": unix(-time.Hour),
+		}}}},
+	}
+	for _, tc := range cases {
+		got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{soon, tc.auth})
+		if err != nil {
+			t.Fatalf("%s: Pick() error = %v", tc.name, err)
+		}
+		if got == nil || got.ID != tc.auth.ID {
+			t.Fatalf("%s: Pick() auth = %v, want %s", tc.name, got, tc.auth.ID)
+		}
 	}
 }
 

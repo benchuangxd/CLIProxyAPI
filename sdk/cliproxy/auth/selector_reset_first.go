@@ -15,8 +15,14 @@ import (
 // Reset times come from the passive quota snapshot observed on upstream responses
 // (Claude anthropic-ratelimit-unified-* and Codex x-codex-* headers). The longest
 // window (weekly) is preferred over the short window because unused weekly quota
-// is the expensive kind to waste. Credentials without a known upcoming reset are
-// ordered after those with one, falling back to deterministic fill-first order.
+// is the expensive kind to waste.
+//
+// Reset times are only learned from traffic, so credentials without a known
+// upcoming reset (never used since startup, or whose window already rolled over)
+// are picked first, in deterministic fill-first order. Each one is used once,
+// its reset is observed, and from then on it is ranked by reset time. Without
+// this, the first credential used would win forever and the others would never
+// be measured.
 type ResetFirstSelector struct {
 	// nowFunc overrides the clock in tests.
 	nowFunc func() time.Time
@@ -57,10 +63,8 @@ func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, o
 	for _, candidate := range available {
 		resetAt, ok := quotaResetAt(candidate, now)
 		if !ok {
-			if picked == nil {
-				picked = candidate
-			}
-			continue
+			// Unmeasured credential: use it so its reset gets observed.
+			return candidate, nil
 		}
 		if pickedReset.IsZero() || resetAt.Before(pickedReset) {
 			picked = candidate
