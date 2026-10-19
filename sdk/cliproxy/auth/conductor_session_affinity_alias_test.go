@@ -133,11 +133,7 @@ func TestManagerSessionAffinityAliasCooldownPreservesSelection(t *testing.T) {
 					cool(highID, targetModel)
 					assertPick("actual target cooldown triggers failover", "stable", lowID)
 					expireSessionAffinityPriorityModelCooldown(t, manager, highID, targetModel)
-					wantAfterRecovery := lowID
-					if mode == "no-session" {
-						wantAfterRecovery = highID
-					}
-					assertPick("higher-priority recovery preserves binding", "stable", wantAfterRecovery)
+					assertPick("higher-priority recovery overrides binding", "stable", highID)
 					assertPick("fresh session uses highest priority", "fresh", highID)
 					cool(highID, targetModel)
 					cool(lowID, targetModel)

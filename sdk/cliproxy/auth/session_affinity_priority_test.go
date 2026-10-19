@@ -8,9 +8,10 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
-func TestManagerSessionAffinityPreservesBindingAcrossHigherPriorityRecovery(t *testing.T) {
+func TestManagerSessionAffinityRebindsAfterHigherPriorityRecovery(t *testing.T) {
 	for _, testCase := range []struct {
 		name           string
 		providerSuffix string
@@ -91,8 +92,8 @@ func TestManagerSessionAffinityPreservesBindingAcrossHigherPriorityRecovery(t *t
 			}
 
 			expireSessionAffinityPriorityModelCooldown(t, manager, highID, model)
-			if got := pick(opts); got.ID != lowID {
-				t.Fatalf("binding after higher-priority recovery = %q, want sticky %q", got.ID, lowID)
+			if got := pick(opts); got.ID != highID {
+				t.Fatalf("binding after higher-priority recovery = %q, want %q", got.ID, highID)
 			}
 
 			newSessionOpts := cliproxyexecutor.Options{Metadata: map[string]any{
@@ -175,4 +176,70 @@ func expireSessionAffinityPriorityModelCooldown(t *testing.T, manager *Manager, 
 	expired := time.Now().Add(-time.Second)
 	state.NextRetryAfter = expired
 	state.Quota.NextRecoverAt = expired
+}
+
+func TestSessionAffinityPriorityChanges(t *testing.T) {
+	for _, mode := range []string{"explicit", "derived", "lcp"} {
+		for _, priority := range []string{"", "5"} {
+			t.Run(mode+"/priority="+priority, func(t *testing.T) {
+				selector := NewSessionAffinitySelector(&RoundRobinSelector{})
+				defer selector.Stop()
+				first := &Auth{ID: "a", Attributes: map[string]string{"priority": priority}}
+				second := &Auth{ID: "b", Attributes: map[string]string{"priority": priority}}
+				auths := []*Auth{first, second}
+				pick := func(want string) {
+					t.Helper()
+					opts := cliproxyexecutor.Options{Metadata: map[string]any{}}
+					switch mode {
+					case "explicit":
+						opts.Headers = http.Header{"X-Session-Id": []string{"stable"}}
+					case "derived":
+						opts.Metadata[cliproxyexecutor.DerivedSessionIDMetadataKey] = "stable"
+					case "lcp":
+						opts.SourceFormat = sdktranslator.FormatOpenAI
+						opts.OriginalRequest = []byte(`{"messages":[{"role":"user","content":"stable prompt"}]}`)
+						opts.Metadata[cliproxyexecutor.CallerScopeMetadataKey] = "caller"
+					}
+					got, errPick := selector.Pick(context.Background(), "openai", "model", opts, auths)
+					if errPick != nil || got == nil || got.ID != want {
+						t.Fatalf("Pick() = %v, %v; want %s", got, errPick, want)
+					}
+				}
+
+				pick(first.ID)
+				pick(first.ID) // Equal or unset priorities preserve affinity despite round-robin.
+				second.Attributes["priority"] = "10"
+				pick(second.ID) // A priority edit overrides the existing binding immediately.
+				pick(second.ID)
+				first.Attributes["priority"] = "10"
+				pick(second.ID) // Equalizing priorities preserves the new binding.
+				second.Disabled = true
+				pick(first.ID) // An unavailable preferred account still permits failover.
+				second.Disabled = false
+				pick(first.ID) // Equal-priority recovery retains the failover binding.
+			})
+		}
+	}
+}
+
+func TestSessionAffinityPriorityOverridesParentBinding(t *testing.T) {
+	selector := NewSessionAffinitySelector(&RoundRobinSelector{})
+	defer selector.Stop()
+	first := &Auth{ID: "a"}
+	second := &Auth{ID: "b", Attributes: map[string]string{}}
+	auths := []*Auth{first, second}
+	parentOpts := cliproxyexecutor.Options{Headers: http.Header{"X-Task-ID": []string{"parent"}}}
+	parent, errParent := selector.Pick(context.Background(), "openai", "model", parentOpts, auths)
+	if errParent != nil || parent == nil || parent.ID != first.ID {
+		t.Fatalf("parent Pick() = %v, %v; want %s", parent, errParent, first.ID)
+	}
+	second.Attributes["priority"] = "10"
+	childOpts := cliproxyexecutor.Options{Headers: http.Header{
+		"X-Task-ID":        []string{"child"},
+		"X-Parent-Task-ID": []string{"parent"},
+	}}
+	child, errChild := selector.Pick(context.Background(), "openai", "model", childOpts, auths)
+	if errChild != nil || child == nil || child.ID != second.ID {
+		t.Fatalf("child Pick() = %v, %v; want higher-priority %s", child, errChild, second.ID)
+	}
 }
